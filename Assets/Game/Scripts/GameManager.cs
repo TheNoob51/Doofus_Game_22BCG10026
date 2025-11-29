@@ -10,7 +10,6 @@ using System.IO;
 /// - Spawns initial area
 /// - Spawns new pulpit exactly spawnInterval seconds after each pulpit is created (scheduled)
 /// - Ensures only maxPlatforms active at any time
-/// - If a delayed spawn needs to occur but active==max, it frees a non-origin slot so the timed spawn happens adjacent to the origin
 /// - Prevents duplicate scheduled spawns for the same grid cell
 /// - Provides ResetSceneClean() for UI retry
 /// </summary>
@@ -84,7 +83,7 @@ public class GameManager : MonoBehaviour
 
     void LoadJsonConfig()
     {
-        string path = System.IO.Path.Combine(Application.streamingAssetsPath, "game_config.json");
+        string path = Path.Combine(Application.streamingAssetsPath, "game_config.json");
         if (!File.Exists(path))
         {
             Debug.Log("[GM] No JSON config found at " + path + " — using inspector defaults.");
@@ -182,18 +181,21 @@ public class GameManager : MonoBehaviour
         if (active.Count >= maxPlatforms)
             return false;
 
-        // Deterministic preferred order: forward (+Z), right (+X), left (-X), back (-Z)
         Vector3[] offsets = new Vector3[]
         {
-            new Vector3(0, 0, gridSpacing),   // forward (preferred)
-            new Vector3(gridSpacing, 0, 0),   // right
-            new Vector3(-gridSpacing, 0, 0),  // left
-            new Vector3(0, 0, -gridSpacing)   // back
+            new Vector3(gridSpacing, 0, 0),
+            new Vector3(-gridSpacing, 0, 0),
+            new Vector3(0, 0, gridSpacing),
+            new Vector3(0, 0, -gridSpacing)
         };
 
-        foreach (var off in offsets)
+        // shuffle order
+        int[] idx = { 0, 1, 2, 3 };
+        for (int i = 0; i < idx.Length; i++) { int r = Random.Range(i, idx.Length); int tmp = idx[r]; idx[r] = idx[i]; idx[i] = tmp; }
+
+        foreach (int i in idx)
         {
-            Vector3 candidateGrid = GridAlign(baseGrid + off);
+            Vector3 candidateGrid = GridAlign(baseGrid + offsets[i]);
             if (!SpotOccupied(candidateGrid))
             {
                 SpawnPulpitAtGrid(candidateGrid);
@@ -259,42 +261,16 @@ public class GameManager : MonoBehaviour
         // wait exactly spawnInterval
         yield return new WaitForSeconds(spawnInterval);
 
-        // prune nulls
+        // if we already have maxPlatforms, abort and clear scheduled flag
         active.RemoveAll(x => x == null);
-
-        // If already at max, attempt to free one non-origin platform to allow the scheduled spawn
         if (active.Count >= maxPlatforms)
         {
-            // find a platform whose grid != originGrid
-            GameObject toRemove = null;
-            foreach (var p in active)
-            {
-                if (p == null) continue;
-                Vector3 g = GridAlign(p.transform.position);
-                if (g != originGrid)
-                {
-                    toRemove = p;
-                    break;
-                }
-            }
-
-            if (toRemove != null)
-            {
-                Debug.Log($"[GM] Delayed spawn needs slot: destroying non-origin platform at {toRemove.transform.position}");
-                active.Remove(toRemove);
-                Destroy(toRemove);
-                // small yield to allow Unity to process destruction before spawn
-                yield return null;
-            }
-            else
-            {
-                Debug.Log($"[GM] Delayed spawn aborted for {originGrid} because no removable non-origin platform found");
-                scheduled.Remove(key);
-                yield break;
-            }
+            Debug.Log($"[GM] Delayed spawn aborted for {originGrid} because activeCount={active.Count} >= maxPlatforms");
+            scheduled.Remove(key);
+            yield break;
         }
 
-        // try to spawn adjacent to originGrid in preferred order
+        // try to spawn adjacent to originGrid
         bool spawned = TrySpawnAdjacent(originGrid);
         if (spawned)
             Debug.Log($"[GM] Delayed spawn executed for {originGrid}");
@@ -321,7 +297,7 @@ public class GameManager : MonoBehaviour
 
         Vector3 gridSource = GridAlign(source.position);
 
-        // if already at max, ignore (we will not force a destroy here)
+        // if already at max, ignore
         active.RemoveAll(x => x == null);
         if (active.Count >= maxPlatforms)
         {
@@ -337,6 +313,7 @@ public class GameManager : MonoBehaviour
             return;
         }
 
+        // schedule at that grid cell (same behavior as SpawnPulpitAtGrid scheduling)
         scheduled.Add(key);
         StartCoroutine(SpawnDelayedCoroutine(gridSource, key));
         Debug.Log($"[GM] RequestSpawnFrom received for {source.name} at {gridSource} -> scheduling spawn after {spawnInterval}s");

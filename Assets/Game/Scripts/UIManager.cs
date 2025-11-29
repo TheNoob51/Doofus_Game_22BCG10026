@@ -72,4 +72,12 @@ public class UIManager : MonoBehaviour
         Time.timeScale = 1f;
         SceneManager.LoadScene("MainMenuScene");
     }
+
+    public void QuitGame()
+    {
+        Application.Quit();
+        #if UNITY_EDITOR
+        UnityEditor.EditorApplication.isPlaying = false; // Stop playing in the editor
+        #endif
+    }
 }

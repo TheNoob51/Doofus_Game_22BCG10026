@@ -1,13 +1,17 @@
 using UnityEngine;
+using System.Collections;
 using System.Collections.Generic;
 using UnityEngine.SceneManagement;
+using System.IO;
 
 /// <summary>
-/// Robust GameManager:
-/// - grid-aligned platform spawning (no Y jitter)
-/// - enforces maxPlatforms (only N active at any time)
-/// - RequestSpawnFrom/ForceSpawnAdjacent operate on grid
-/// - ResetSceneClean() for UI Retry
+/// Grid-aligned GameManager that:
+/// - Loads JSON config (player speed, pulpit lifetimes, spawnInterval)
+/// - Spawns initial area
+/// - Spawns new pulpit exactly spawnInterval seconds after each pulpit is created (scheduled)
+/// - Ensures only maxPlatforms active at any time
+/// - Prevents duplicate scheduled spawns for the same grid cell
+/// - Provides ResetSceneClean() for UI retry
 /// </summary>
 public class GameManager : MonoBehaviour
 {
@@ -16,20 +20,28 @@ public class GameManager : MonoBehaviour
     [Header("References")]
     public GameObject pulpitPrefab;   // assign prefab
     public GameObject player;         // assign Player gameobject
-    public Transform spawnPoint;      // initial spawn origin (use this as grid origin)
+    public Transform spawnPoint;      // initial spawn origin (grid origin)
 
     [Header("Lifetime Settings")]
     public float minLifetime = 4f;
     public float maxLifetime = 5f;
 
-    [Header("Platform Counts")]
-    public int maxPlatforms = 2;      // IMPORTANT: user requested exactly 2 active at once
-    public int initialFill = 1;       // initial number to create (should be <= maxPlatforms)
+    [Header("Platform Counts & Grid")]
+    public int maxPlatforms = 2;      // exactly how many active at once
+    public int initialFill = 1;       // how many to place at start (<= maxPlatforms)
+    private float gridSpacing = 3f;   // will be derived from pulpitPrefab scale.x
+    private float spawnY = 0f;
 
-    // internal
+    [Header("Spawn timing (from JSON)")]
+    public float spawnInterval = 2.5f; // will be overwritten by JSON if present
+
+    // internal lists
     private List<GameObject> active = new List<GameObject>();
-    private float gridSpacing = 3f;   // will be set from pulpitPrefab scale.x at Start
-    private float spawnY = 0f;        // fixed Y for all platforms
+    // scheduled grid keys prevents double scheduling for same origin cell
+    private HashSet<string> scheduled = new HashSet<string>();
+
+    // JSON config class (expects GameConfig in project)
+    private GameConfig config;
 
     void Awake()
     {
@@ -38,6 +50,9 @@ public class GameManager : MonoBehaviour
 
     void Start()
     {
+        // load json config if present
+        LoadJsonConfig();
+
         if (pulpitPrefab == null)
         {
             Debug.LogError("[GM] pulpitPrefab not assigned!");
@@ -50,44 +65,80 @@ public class GameManager : MonoBehaviour
         }
         if (spawnPoint == null)
         {
-            Debug.LogWarning("[GM] spawnPoint not assigned � using origin (0,0,0)");
+            Debug.LogWarning("[GM] spawnPoint not assigned — using origin (0,0,0)");
             spawnPoint = new GameObject("SpawnPoint_TEMP").transform;
             spawnPoint.position = Vector3.zero;
         }
 
-        // set grid spacing from prefab width (center-to-center)
+        // derive grid spacing from prefab scale.x (center-to-center)
         gridSpacing = Mathf.Abs(pulpitPrefab.transform.localScale.x);
         if (gridSpacing <= 0.01f) gridSpacing = 3f;
         spawnY = spawnPoint.position.y;
 
-        Debug.Log($"[GM] Start() gridSpacing={gridSpacing} spawnY={spawnY} maxPlatforms={maxPlatforms}");
+        Debug.Log($"[GM] Start() gridSpacing={gridSpacing} spawnY={spawnY} maxPlatforms={maxPlatforms} spawnInterval={spawnInterval}");
 
-        // spawn initial platforms (respect maxPlatforms)
+        // Spawn initial platforms
         SpawnStartArea();
     }
 
-    // ------------------------------------------------------------------
-    // Spawning helpers
-    // ------------------------------------------------------------------
+    void LoadJsonConfig()
+    {
+        string path = Path.Combine(Application.streamingAssetsPath, "game_config.json");
+        if (!File.Exists(path))
+        {
+            Debug.Log("[GM] No JSON config found at " + path + " — using inspector defaults.");
+            return;
+        }
+        try
+        {
+            string json = File.ReadAllText(path);
+            config = JsonUtility.FromJson<GameConfig>(json);
+            if (config != null)
+            {
+                if (config.player_data != null)
+                {
+                    // apply player speed if PlayerController present
+                    var pc = player != null ? player.GetComponent<PlayerController>() : null;
+                    if (pc != null)
+                    {
+                        pc.speed = config.player_data.speed;
+                        Debug.Log("[GM] Applied player speed: " + pc.speed);
+                    }
+                }
+                if (config.pulpit_data != null)
+                {
+                    minLifetime = config.pulpit_data.min_pulpit_destroy_time;
+                    maxLifetime = config.pulpit_data.max_pulpit_destroy_time;
+                    spawnInterval = config.pulpit_data.pulpit_spawn_time;
+                    Debug.Log($"[GM] Applied pulpit lifetimes: min={minLifetime} max={maxLifetime} spawnInterval={spawnInterval}");
+                }
+            }
+        }
+        catch (System.Exception ex)
+        {
+            Debug.LogError("[GM] Failed to read JSON config: " + ex.Message);
+        }
+    }
+
+    // -------------------- Startup spawning --------------------
     void SpawnStartArea()
     {
         Vector3 origin = GridAlign(spawnPoint.position);
 
-        // Ensure we do not exceed maxPlatforms
         int toSpawn = Mathf.Clamp(initialFill, 1, maxPlatforms);
 
-        // Spawn base at origin
+        // spawn base
         SpawnPulpitAtGrid(origin);
 
-        // place player above the origin platform
+        // place player on top of base
         PlacePlayerOn(origin);
 
-        // Fill others adjacent (tries available directions)
+        // fill adjacent to reach 'toSpawn' count
         for (int i = 1; i < toSpawn; i++)
             ForceSpawnAdjacent(origin);
     }
 
-    // Align position to grid (center positions)
+    // Align arbitrary world position to grid center positions
     Vector3 GridAlign(Vector3 worldPos)
     {
         float gx = Mathf.Round(worldPos.x / gridSpacing) * gridSpacing;
@@ -95,9 +146,9 @@ public class GameManager : MonoBehaviour
         return new Vector3(gx, spawnY, gz);
     }
 
+    // spawn a pulpit at a grid center; schedule its delayed neighbor spawn
     GameObject SpawnPulpitAtGrid(Vector3 gridCenter)
     {
-        // safety: remove null references
         active.RemoveAll(x => x == null);
 
         if (active.Count >= maxPlatforms)
@@ -115,16 +166,20 @@ public class GameManager : MonoBehaviour
         pulp.Init(minLifetime, maxLifetime);
 
         Debug.Log($"[GM] Spawned pulpit at {pos} activeCount={active.Count}");
+
+        // Schedule a spawn relative to this pulpit's grid center after spawnInterval
+        ScheduleSpawnAtGrid(gridCenter);
+
         return p;
     }
 
-    // Try to spawn adjacent to basePos (grid-aligned). returns true if spawned.
-    bool TrySpawnAdjacent(Vector3 basePos)
+    // Try spawn adjacent to baseGrid; returns true if a pulpit was spawned
+    bool TrySpawnAdjacent(Vector3 baseGrid)
     {
-        // remove dead refs
         active.RemoveAll(x => x == null);
 
-        if (active.Count >= maxPlatforms) return false;
+        if (active.Count >= maxPlatforms)
+            return false;
 
         Vector3[] offsets = new Vector3[]
         {
@@ -134,27 +189,26 @@ public class GameManager : MonoBehaviour
             new Vector3(0, 0, -gridSpacing)
         };
 
-        // try in random order for variety
+        // shuffle order
         int[] idx = { 0, 1, 2, 3 };
         for (int i = 0; i < idx.Length; i++) { int r = Random.Range(i, idx.Length); int tmp = idx[r]; idx[r] = idx[i]; idx[i] = tmp; }
 
         foreach (int i in idx)
         {
-            Vector3 candidate = basePos + offsets[i];
-            Vector3 grid = GridAlign(candidate);
-            if (!SpotOccupied(grid))
+            Vector3 candidateGrid = GridAlign(baseGrid + offsets[i]);
+            if (!SpotOccupied(candidateGrid))
             {
-                SpawnPulpitAtGrid(grid);
+                SpawnPulpitAtGrid(candidateGrid);
                 return true;
             }
         }
+
         return false;
     }
 
-    // Force spawn adjacent (used at start) - tries all directions
+    // Force spawn adjacent (used at start) - tries all directions deterministically
     void ForceSpawnAdjacent(Vector3 baseWorld)
     {
-        // try all directions
         Vector3[] offsets = new Vector3[]
         {
             new Vector3(gridSpacing, 0, 0),
@@ -174,10 +228,9 @@ public class GameManager : MonoBehaviour
         }
     }
 
-    // returns true if a platform center is within threshold of pos
     bool SpotOccupied(Vector3 gridCenter)
     {
-        float threshold = gridSpacing * 0.9f; // slightly less than spacing to avoid false overlap
+        float threshold = gridSpacing * 0.6f;
         foreach (var p in active)
         {
             if (p == null) continue;
@@ -187,31 +240,85 @@ public class GameManager : MonoBehaviour
         return false;
     }
 
-    // ------------------------------------------------------------------
-    // External API used by Pulpit
-    // ------------------------------------------------------------------
-    // Pulpit calls this to request spawning a neighbor from its position
+    // -------------------- Scheduling logic --------------------
+    // Prevent duplicate scheduled spawn for a given origin grid cell.
+    void ScheduleSpawnAtGrid(Vector3 originGrid)
+    {
+        string key = GridKey(originGrid);
+        if (scheduled.Contains(key))
+        {
+            Debug.Log($"[GM] Spawn already scheduled for {originGrid} (key={key})");
+            return;
+        }
+
+        scheduled.Add(key);
+        StartCoroutine(SpawnDelayedCoroutine(originGrid, key));
+        Debug.Log($"[GM] Scheduled spawn for {originGrid} after {spawnInterval}s (key={key})");
+    }
+
+    IEnumerator SpawnDelayedCoroutine(Vector3 originGrid, string key)
+    {
+        // wait exactly spawnInterval
+        yield return new WaitForSeconds(spawnInterval);
+
+        // if we already have maxPlatforms, abort and clear scheduled flag
+        active.RemoveAll(x => x == null);
+        if (active.Count >= maxPlatforms)
+        {
+            Debug.Log($"[GM] Delayed spawn aborted for {originGrid} because activeCount={active.Count} >= maxPlatforms");
+            scheduled.Remove(key);
+            yield break;
+        }
+
+        // try to spawn adjacent to originGrid
+        bool spawned = TrySpawnAdjacent(originGrid);
+        if (spawned)
+            Debug.Log($"[GM] Delayed spawn executed for {originGrid}");
+        else
+            Debug.Log($"[GM] Delayed spawn could not find adjacent spot for {originGrid}");
+
+        // clear scheduled marker
+        scheduled.Remove(key);
+    }
+
+    string GridKey(Vector3 grid)
+    {
+        int gx = Mathf.RoundToInt(grid.x / gridSpacing);
+        int gz = Mathf.RoundToInt(grid.z / gridSpacing);
+        return gx + "_" + gz;
+    }
+
+    // -------------------- External API used by Pulpit --------------------
+    // Pulpit can still request spawn (backwards compatible) — we will schedule a spawn using
+    // the pulpit's grid cell if none is scheduled. This keeps compatibility.
     public void RequestSpawnFrom(Transform source)
     {
         if (source == null) return;
-        // use source position aligned to grid
+
         Vector3 gridSource = GridAlign(source.position);
 
-        // if active already at max, we do nothing (requirement: only maxPlatforms active)
+        // if already at max, ignore
+        active.RemoveAll(x => x == null);
         if (active.Count >= maxPlatforms)
         {
             Debug.Log("[GM] RequestSpawnFrom ignored: maxPlatforms reached");
             return;
         }
 
-        bool spawned = TrySpawnAdjacent(gridSource);
-        if (!spawned)
+        // schedule a spawn after spawnInterval (if not already scheduled)
+        string key = GridKey(gridSource);
+        if (scheduled.Contains(key))
         {
-            Debug.Log("[GM] RequestSpawnFrom: no free adjacent spot found for " + source.name);
+            Debug.Log("[GM] RequestSpawnFrom: spawn already scheduled for " + gridSource);
+            return;
         }
+
+        // schedule at that grid cell (same behavior as SpawnPulpitAtGrid scheduling)
+        scheduled.Add(key);
+        StartCoroutine(SpawnDelayedCoroutine(gridSource, key));
+        Debug.Log($"[GM] RequestSpawnFrom received for {source.name} at {gridSource} -> scheduling spawn after {spawnInterval}s");
     }
 
-    // Called by Pulpit when it is destroyed
     public void NotifyDestroyed(GameObject p)
     {
         if (p == null)
@@ -222,29 +329,24 @@ public class GameManager : MonoBehaviour
         if (active.Contains(p))
             active.Remove(p);
 
-        Debug.Log($"[GM] NotifyDestroyed for '{(p ? p.name : "null")}' before removal -> active now={active.Count}");
+        Debug.Log($"[GM] NotifyDestroyed for '{p.name}' -> active now={active.Count}");
 
-        // Optional immediate refill if below desired initialFill count:
+        // If active fell below initialFill, attempt a refill adjacent to player first, else origin
         if (active.Count < initialFill)
         {
-            // try spawn adjacent to player first
             if (!TrySpawnAdjacent(player.transform.position))
             {
-                // else try around origin
                 ForceSpawnAdjacent(spawnPoint.position);
             }
         }
     }
 
-    // ------------------------------------------------------------------
-    // Player placement
-    // ------------------------------------------------------------------
+    // -------------------- Player placement --------------------
     void PlacePlayerOn(Vector3 gridCenter)
     {
-        Vector3 playerPos = new Vector3(gridCenter.x, spawnY + 1.0f, gridCenter.z); // assume player half height ~0.5
+        Vector3 playerPos = new Vector3(gridCenter.x, spawnY + 1.0f, gridCenter.z);
         player.transform.position = playerPos;
 
-        // zero velocities if rigidbody
         var rb = player.GetComponent<Rigidbody>();
         if (rb != null)
         {
@@ -255,9 +357,7 @@ public class GameManager : MonoBehaviour
         Debug.Log("[GM] Player placed at " + playerPos);
     }
 
-    // ------------------------------------------------------------------
-    // Retry helper called by UIManager
-    // ------------------------------------------------------------------
+    // -------------------- Retry helper --------------------
     public void ResetSceneClean()
     {
         Debug.Log("[GM] ResetSceneClean called: destroying active pulpits and reloading scene.");
@@ -267,12 +367,12 @@ public class GameManager : MonoBehaviour
             if (obj != null) Destroy(obj);
         }
         active.Clear();
+        scheduled.Clear();
 
         Time.timeScale = 1f;
         SceneManager.LoadScene(SceneManager.GetActiveScene().name);
     }
 
-    // Editor/Test helper
     [ContextMenu("Debug_LogActive")]
     void DebugLogActive()
     {

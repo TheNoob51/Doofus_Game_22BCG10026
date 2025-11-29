@@ -12,7 +12,7 @@ using System.Collections;
 public class Pulpit : MonoBehaviour
 {
     public float lifetime = 4f;
-    public TextMesh countdownText; // optional world TextMesh to display remaining lifetime
+    public TextMesh countdownText; // assign in prefab (optional world UI text to display remaining lifetime)
 
     bool hasRequested = false;
 
@@ -29,12 +29,14 @@ public class Pulpit : MonoBehaviour
 
         while (t > 0f)
         {
-            t -= Time.deltaTime;
-
+            // update UI at start of frame
             if (countdownText != null)
             {
-                countdownText.text = (t > 0f) ? t.ToString("0.00") : "0.00";
+                countdownText.text = t.ToString("0.00");
             }
+
+            // decrease
+            t -= Time.deltaTime;
 
             // legacy compatibility: request spawn somewhat early (optional)
             if (!hasRequested && t <= lifetime * 0.6f)
@@ -49,6 +51,9 @@ public class Pulpit : MonoBehaviour
 
             yield return null;
         }
+
+        // finalize display to 0.00
+        if (countdownText != null) countdownText.text = "0.00";
 
         // lifetime ended: notify manager and destroy
         if (GameManager.Instance != null)
